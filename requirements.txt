@@ -1,0 +1,9 @@
+click
+fastapi
+uvicorn[standard]
+sentence-transformers
+chromadb
+llama-cpp-python
+PyPDF2
+pdfminer.six
+openai

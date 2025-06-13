@@ -1,0 +1,17 @@
+[project]
+name = "taxmemate"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "click>=8.2.1",
+    "datasets>=3.6.0",
+    "faiss-cpu>=1.11.0",
+    "numpy>=2.3.0",
+    "pypdf2>=3.0.1",
+    "sentence-transformers>=4.1.0",
+    "tqdm>=4.67.1",
+    "transformers>=4.52.4",
+    "trl>=0.18.1",
+]

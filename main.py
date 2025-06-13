@@ -1,157 +1,197 @@
+"""
+TaxMeMate CLI: A Retrieval-Augmented Generation (RAG) assistant for tax reduction strategies.
+
+Commands:
+  clean      Extract and clean raw PDF/TXT tax documents
+  chunk      Tokenize and chunk cleaned documents
+  index      Build a FAISS vector index
+  train-sft  Fine-tune the model with supervised data
+  chat       Interactively query TaxMeMate
+"""
 import os
+import re
+import json
 import click
-from pathlib import Path
-from typing import List
-from doc_proc import load_docs_from_folder, chunk_text
-from generator import generate_answer_local_llama, generate_answer_openai
+import pickle
+from glob import glob
+from tqdm import tqdm
+from PyPDF2 import PdfReader
 
-import chromadb
-from sentence_transformers import SentenceTransformer
+# ----- Utilities -----
 
-@click.command(name="build-index-cmd")
-@click.option(
-    "--docs-dir", default="docs", type=click.Path(exists=True),
-    help="Folder containing PDF/Markdown docs to index."
-)
-@click.option(
-    "--index-dir", default="data/chroma", type=click.Path(),
-    help="Where to store the Chroma vector index."
-)
-def build_index_cmd(docs_dir, index_dir):
-    """
-    Build embeddings + vector index from raw documents.
-    """
-    docs_folder = Path(docs_dir)
-    idx_folder = Path(index_dir)
-    idx_folder.mkdir(parents=True, exist_ok=True)
+def clean_text(text: str) -> str:
+    """Remove unwanted characters and normalize whitespace."""
+    text = re.sub(r'<[^>]+>', ' ', text)
+    text = re.sub(r'[\r\n]+', ' ', text)
+    return re.sub(r'\s+', ' ', text).strip()
 
-    docs = load_docs_from_folder(docs_folder)
-    all_chunks = []
-    for doc_id, full_text in docs:
-        chunks = chunk_text(full_text, chunk_size=200)
-        for i, c in enumerate(chunks):
-            chunk_id = f"{doc_id}::chunk_{i}"
-            all_chunks.append({"id": chunk_id, "text": c, "metadata": {"source": doc_id, "chunk_index": i}})
 
-    client = chromadb.Client()
-    collection = client.create_collection(name="moveoutmate_docs")
+def extract_text_from_pdf(path: str) -> str:
+    """Extract text from a PDF file."""
+    reader = PdfReader(path)
+    texts = []
+    for page in reader.pages:
+        ptext = page.extract_text()
+        if ptext:
+            texts.append(ptext)
+    return "\n".join(texts)
 
-    embed_model = SentenceTransformer(os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2"))
-    def embed_fn(texts: List[str]) -> List[List[float]]:
-        return embed_model.encode(texts, show_progress_bar=True).tolist()
-
-    texts = [chunk["text"] for chunk in all_chunks]
-    ids = [chunk["id"] for chunk in all_chunks]
-    metadatas = [chunk["metadata"] for chunk in all_chunks]
-
-    collection.add(
-        documents=texts,
-        ids=ids,
-        metadatas=metadatas,
-        embedding_function=embed_fn,
-    )
-
-    collection.persist()
-    click.echo(f"Indexed {len(all_chunks)} chunks from {len(docs)} documents into {idx_folder}")
-
-# ---------------- LOADING INDEX ----------------
-def load_chroma_index(index_dir: Path):
-    client = chromadb.Client()
-    collection = client.get_or_create_collection(
-        name="moveoutmate_docs",
-        persist_directory=str(index_dir)
-    )
-    return collection
-
-# ---------------- EMBED & RETRIEVE ----------------
-def embed_and_retrieve(collection, question: str, top_k: int = 3) -> List[dict]:
-    embed_model = SentenceTransformer(os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2"))
-    q_embed = embed_model.encode([question]).tolist()[0]
-    results = collection.query(
-        query_embeddings=[q_embed],
-        n_results=top_k,
-        include=["documents", "metadatas", "ids"]
-    )
-    retrieved = []
-    docs = results["documents"][0]
-    metas = results["metadatas"][0]
-    ids = results["ids"][0]
-    for idx in range(len(docs)):
-        retrieved.append({
-            "id": ids[idx],
-            "text": docs[idx],
-            "metadata": metas[idx]
-        })
-    return retrieved
-
-# ---------------- GENERATION (LOCAL LLaMA OR OPENAI) ----------------
-
-# ---------------- CLI ENTRYPOINT ----------------
+# ----- CLI -----
 @click.group()
-@click.option(
-    "--llama-model-path", type=click.Path(exists=True),
-    default=lambda: os.getenv("LLAMA_MODEL_PATH", "/models/llama-2-q4.bin"),
-    help="Path to local Llama model .bin file."
-)
-@click.pass_context
-def cli(ctx, llama_model_path):
-    """MoveOutMate-CLI: RAG Q&A for student move-out."""
-    ctx.ensure_object(dict)
-    ctx.obj["llama_model_path"] = llama_model_path
+def cli():
+    pass
 
-@cli.command(name="build-index")
-@click.option(
-    "--docs-dir", default="docs", type=click.Path(exists=True),
-    help="Folder containing raw PDF/Markdown docs."
-)
-@click.option(
-    "--index-dir", default="data/chroma", type=click.Path(),
-    help="Folder to write persisted vector index files."
-)
-def build_index(ctx, docs_dir, index_dir):
-    build_index_cmd(docs_dir, index_dir)
-
-@cli.command(name="ask")
-@click.option(
-    "--index-dir", default="data/chroma", type=click.Path(exists=True),
-    help="Folder where vector index is stored."
-)
-@click.option("--question", "-q", default=None, type=str, help="Ask a single question and exit.")
-@click.option("--interactive/--no-interactive", default=False, help="Start interactive REPL.")
-@click.option("--use-openai/--no-openai", default=False, help="Use OpenAI for generation instead of local Llama.")
-@click.pass_context
-def ask(ctx, index_dir, question, interactive, use_openai):
-    """Query MoveOutMate via CLI. Either pass a question or run interactive REPL."""
-    idx_folder = Path(index_dir)
-    collection = load_chroma_index(idx_folder)
-    llama_path = ctx.obj.get("llama_model_path")
-
-    def answer_query(q: str):
-        retrieved = embed_and_retrieve(collection, q, top_k=3)
-        if use_openai:
-            ans = generate_answer_openai(retrieved, q)
-        else:
-            ans = generate_answer_local_llama(retrieved, q, model_path=llama_path)
-        click.echo("\n--- MoveOutMate Answer ---")
-        click.echo(ans)
-        click.echo("--------------------------\n")
-
-    if question:
-        answer_query(question)
-    elif interactive:
-        click.echo("MoveOutMate CLI Interactive Mode (type 'exit' or Ctrl+C to quit)")
-        while True:
+@cli.command()
+@click.argument('input_dir', type=click.Path(exists=True))
+@click.argument('output_file', type=click.Path())
+def clean(input_dir, output_file):
+    """Extract text from PDFs/TXTs in INPUT_DIR, clean, and output JSONL to OUTPUT_FILE."""
+    paths = glob(os.path.join(input_dir, '*'))
+    with open(output_file, 'w') as out:
+        for path in tqdm(paths, desc='Cleaning docs'):
+            ext = os.path.splitext(path)[1].lower()
             try:
-                q = click.prompt("Your question")
-            except (EOFError, KeyboardInterrupt):
-                click.echo("\nExiting.")
-                break
-            if q.strip().lower() in ("exit", "quit"):
-                break
-            answer_query(q)
-    else:
-        click.echo("Error: Provide either --question or --interactive flag.")
-        click.echo("E.g.: python moveoutmate.py ask --question \"How do I cancel utilities?\"")
+                if ext == '.pdf':
+                    raw = extract_text_from_pdf(path)
+                elif ext == '.txt':
+                    with open(path, 'r', encoding='utf-8', errors='ignore') as f:
+                        raw = f.read()
+                else:
+                    continue
+                cleaned = clean_text(raw)
+                if cleaned:
+                    json.dump({'text': cleaned}, out)
+                    out.write('\n')
+            except Exception as e:
+                click.echo(f'Warning: Failed to process {path}: {e}', err=True)
+    click.echo(f'Cleaned docs written to {output_file}')
 
-if __name__ == "__main__":
+@cli.command()
+@click.argument('cleaned_file', type=click.Path(exists=True))
+@click.argument('chunks_file', type=click.Path())
+@click.option('--model', default='meta-llama/Llama-3-8b', help='Tokenizer model')
+def chunk(cleaned_file, chunks_file, model):
+    """Chunk texts from CLEANED_FILE into JSONL CHUNKS_FILE."""
+    # Lazy imports for faster startup
+    from transformers import AutoTokenizer
+    from datasets import load_dataset
+
+    tokenizer = AutoTokenizer.from_pretrained(model, use_fast=True)
+    with open(chunks_file, 'w') as out:
+        for entry in load_dataset('json', data_files=cleaned_file, split='train'):
+            text = entry['text']
+            enc = tokenizer(
+                text,
+                return_overflowing_tokens=True,
+                max_length=512,
+                stride=64,
+                truncation=True
+            )
+            for ids in enc['input_ids']:
+                chunk_text = tokenizer.decode(ids, clean_up_tokenization_spaces=True)
+                json.dump({'chunk': chunk_text}, out)
+                out.write('\n')
+    click.echo(f'Chunks written to {chunks_file}')
+
+@cli.command()
+@click.argument('chunks_file', type=click.Path(exists=True))
+@click.argument('index_file', type=click.Path())
+@click.argument('meta_file', type=click.Path())
+@click.option('--embed-model', default='all-MiniLM-L6-v2', help='Sentence embedder')
+def index(chunks_file, index_file, meta_file, embed_model):
+    """Build FAISS index from CHUNKS_FILE, save to INDEX_FILE and META_FILE."""
+    # Lazy imports
+    import faiss
+    from sentence_transformers import SentenceTransformer
+    from datasets import load_dataset
+
+    embedder = SentenceTransformer(embed_model)
+    dim = embedder.get_sentence_embedding_dimension()
+    idx = faiss.IndexFlatL2(dim)
+    meta = []
+    for entry in load_dataset('json', data_files=chunks_file, split='train'):
+        text = entry['chunk']
+        vec = embedder.encode(text)
+        idx.add(vec.reshape(1, -1))
+        meta.append(text)
+    faiss.write_index(idx, index_file)
+    with open(meta_file, 'wb') as f:
+        pickle.dump(meta, f)
+    click.echo(f'Index saved to {index_file}, metadata to {meta_file}')
+
+@cli.command()
+@click.argument('sft_file', type=click.Path(exists=True))
+@click.argument('output_dir', type=click.Path())
+@click.option('--model', default='meta-llama/Llama-3-8b', help='Base model')
+@click.option('--batch', default=4, help='Train batch size')
+@click.option('--epochs', default=3, help='Number of epochs')
+def train_sft(sft_file, output_dir, model, batch, epochs):
+    """Supervised fine-tune with SFTTrainer on SFT_FILE dataset."""
+    # Lazy imports
+    from transformers import AutoTokenizer, TrainingArguments
+    from unsloth import FastLanguageModel, get_chat_template
+    from datasets import load_dataset
+    from trl import SFTTrainer
+
+    tokenizer = AutoTokenizer.from_pretrained(model)
+    model_fast = FastLanguageModel.from_pretrained(model)
+    template = get_chat_template('alpaca')
+    ds = load_dataset('json', data_files=sft_file, split='train')
+    args = TrainingArguments(
+        per_device_train_batch_size=batch,
+        learning_rate=2e-5,
+        num_train_epochs=epochs,
+        output_dir=output_dir
+    )
+    trainer = SFTTrainer(
+        model=model_fast,
+        args=args,
+        train_dataset=ds,
+        tokenizer=tokenizer,
+        template=template
+    )
+    trainer.train()
+    click.echo(f'SFT model saved to {output_dir}')
+
+@cli.command()
+@click.argument('index_file', type=click.Path(exists=True))
+@click.argument('meta_file', type=click.Path(exists=True))
+@click.option('--rag-model', default='gpt-3.5-turbo', help='LLM for RAG')
+@click.option('--embed-model', default='all-MiniLM-L6-v2', help='Embedder model')
+@click.option('--sft-model', default=None, help='Path to SFT model')
+def chat(index_file, meta_file, rag_model, embed_model, sft_model):
+    """Interactive RAG chat session."""
+    # Lazy imports
+    import faiss
+    from sentence_transformers import SentenceTransformer
+    from transformers import AutoTokenizer, AutoModelForCausalLM
+
+    idx = faiss.read_index(index_file)
+    with open(meta_file, 'rb') as f:
+        meta = pickle.load(f)
+    embedder = SentenceTransformer(embed_model)
+
+    if sft_model:
+        tokenizer = AutoTokenizer.from_pretrained(sft_model)
+        model = AutoModelForCausalLM.from_pretrained(sft_model)
+    else:
+        tokenizer = AutoTokenizer.from_pretrained(rag_model)
+        model = AutoModelForCausalLM.from_pretrained(rag_model)
+
+    click.echo("TaxMeMate is ready! Ask your tax questions (type 'exit' to quit).")
+    while True:
+        query = input('> ')
+        if query.lower() in ('exit', 'quit'):
+            break
+        q_vec = embedder.encode(query)
+        D, I = idx.search(q_vec.reshape(1, -1), 5)
+        context = "\n".join(meta[i] for i in I[0])
+        prompt = f"Context:\n{context}\n\nUser: {query}\nAssistant:"
+        inputs = tokenizer(prompt, return_tensors='pt')
+        outputs = model.generate(**inputs, max_new_tokens=200)
+        answer = tokenizer.decode(outputs[0], skip_special_tokens=True)
+        click.echo(answer.split('Assistant:')[-1].strip())
+
+if __name__ == '__main__':
     cli()
+
